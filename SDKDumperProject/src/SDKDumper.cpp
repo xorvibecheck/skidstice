@@ -28,6 +28,7 @@
 #include <fcntl.h>
 
 namespace fs = std::filesystem;
+namespace SDKDumper {
 
 // Console logging helpers ----------------------------------------------------
 static HANDLE g_hConsole = nullptr;
