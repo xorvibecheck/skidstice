@@ -9,7 +9,7 @@ target_include_directories(SDKDumper PRIVATE include)
 target_compile_features(SDKDumper PRIVATE cxx_std_17)
 
 if (WIN32)
-    target_link_libraries(SDKDumper PRIVATE psapi dbghelp)
+    target_link_libraries(SDKDumper PRIVATE psapi dbghelp WindowsApp)
     target_compile_definitions(SDKDumper PRIVATE "_WINDOWS")
 endif()
 
