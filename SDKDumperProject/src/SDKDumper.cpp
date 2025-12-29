@@ -99,6 +99,34 @@ static std::wstring GetLocalAppDataPath() {
     return L"";
 }
 
+// Check whether a memory range is readable in this process (covers multi-page ranges)
+static bool IsReadableRange(const void *addr, size_t size) {
+    if (!addr || size == 0) return false;
+    const uint8_t *p = (const uint8_t*)addr;
+    size_t remaining = size;
+    while (remaining) {
+        MEMORY_BASIC_INFORMATION mbi;
+        SIZE_T ret = VirtualQuery(p, &mbi, sizeof(mbi));
+        if (ret == 0) return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        DWORD prot = mbi.Protect;
+        if (prot & PAGE_GUARD) return false;
+        if (prot & PAGE_NOACCESS) return false;
+        const DWORD readableFlags = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if ((prot & readableFlags) == 0) return false;
+        uintptr_t regionEnd = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        uintptr_t cur = (uintptr_t)p;
+        size_t avail = (size_t)(regionEnd - cur);
+        size_t chunk = avail < remaining ? avail : remaining;
+        p += chunk;
+        remaining -= chunk;
+    }
+    return true;
+}
+
+// forward declare HexPrefix since it's used before its definition
+static std::string HexPrefix(uintptr_t addr, size_t maxBytes=32);
+
 static bool EnsureDirectory(const std::wstring &dir) {
     std::error_code ec;
     fs::create_directories(dir, ec);
@@ -131,31 +159,42 @@ static ModuleDump ParseModule(HMODULE hMod) {
     }
 
     BYTE *base = (BYTE*)hMod;
-    __try {
-        IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER*)base;
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return m;
-        IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE) return m;
-        auto &opt = nt->OptionalHeader;
-        auto expDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-        if (expDir.VirtualAddress == 0) return m;
-        IMAGE_EXPORT_DIRECTORY *exp = (IMAGE_EXPORT_DIRECTORY*)(base + expDir.VirtualAddress);
-        DWORD *names = (DWORD*)(base + exp->AddressOfNames);
-        WORD *ords = (WORD*)(base + exp->AddressOfNameOrdinals);
-        DWORD *funcs = (DWORD*)(base + exp->AddressOfFunctions);
-        for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
-            const char *ename = (const char*)(base + names[i]);
-            WORD ord = ords[i];
-            DWORD fnrva = funcs[ord];
-            ExportEntry e;
-            e.name = ename ? ename : std::string();
-            e.rva = fnrva;
-            e.address = m.base + fnrva;
-            e.ordinal = (uint32_t)(exp->Base + ord);
-            m.exports.push_back(e);
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // best-effort; continue
+    // Safely validate PE headers and exports using readable-range checks
+    if (!IsReadableRange(base, sizeof(IMAGE_DOS_HEADER))) return m;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return m;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (!IsReadableRange(nt, sizeof(IMAGE_NT_HEADERS))) return m;
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return m;
+    auto &opt = nt->OptionalHeader;
+    auto expDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (expDir.VirtualAddress == 0) return m;
+    IMAGE_EXPORT_DIRECTORY *exp = (IMAGE_EXPORT_DIRECTORY*)(base + expDir.VirtualAddress);
+    if (!IsReadableRange(exp, sizeof(IMAGE_EXPORT_DIRECTORY))) return m;
+    // Validate name/address tables
+    DWORD *names = (DWORD*)(base + exp->AddressOfNames);
+    WORD *ords = (WORD*)(base + exp->AddressOfNameOrdinals);
+    DWORD *funcs = (DWORD*)(base + exp->AddressOfFunctions);
+    if (!IsReadableRange(names, sizeof(DWORD) * exp->NumberOfNames)) return m;
+    if (!IsReadableRange(ords, sizeof(WORD) * exp->NumberOfNames)) return m;
+    if (!IsReadableRange(funcs, sizeof(DWORD) * exp->NumberOfFunctions)) return m;
+    for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+        const char *ename = (const char*)(base + names[i]);
+        if (!IsReadableRange(ename, 1)) continue;
+        // ensure string is readable up to some reasonable length
+        size_t maxLen = 256;
+        size_t len = 0;
+        while (len < maxLen && IsReadableRange(ename + len, 1) && ename[len]) ++len;
+        std::string nameStr;
+        if (len > 0) nameStr.assign(ename, ename + len);
+        WORD ord = ords[i];
+        DWORD fnrva = funcs[ord];
+        ExportEntry e;
+        e.name = nameStr;
+        e.rva = fnrva;
+        e.address = m.base + fnrva;
+        e.ordinal = (uint32_t)(exp->Base + ord);
+        m.exports.push_back(e);
     }
 
     return m;
@@ -165,7 +204,7 @@ static ModuleDump ParseModule(HMODULE hMod) {
 static std::string DemangleMSVC(const std::string &mangled) {
     if (mangled.empty()) return {};
     char buf[1024] = {0};
-    if (UnDecorateSymbolNameA(mangled.c_str(), buf, (DWORD)sizeof(buf), UNDNAME_COMPLETE)) {
+    if (UnDecorateSymbolName(mangled.c_str(), buf, (DWORD)sizeof(buf), UNDNAME_COMPLETE)) {
         return std::string(buf);
     }
     return mangled;
@@ -177,21 +216,23 @@ static bool InRange(uintptr_t base, uint32_t size, uintptr_t addr) {
 
 // Find code section range inside module
 static bool GetCodeRange(BYTE *base, size_t moduleSize, uintptr_t &codeStart, uintptr_t &codeEnd) {
-    __try {
-        IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER*)base;
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-        IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-        IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
-        for (unsigned i=0;i<nt->FileHeader.NumberOfSections;i++) {
-            auto &s = sec[i];
-            if (strncmp((char*)s.Name, ".text", 5) == 0 || (s.Characteristics & IMAGE_SCN_CNT_CODE)) {
-                codeStart = (uintptr_t)base + s.VirtualAddress;
-                codeEnd = codeStart + s.Misc.VirtualSize;
-                return true;
-            }
+    // Validate headers and section table with readable checks
+    if (!IsReadableRange(base, sizeof(IMAGE_DOS_HEADER))) return false;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (!IsReadableRange(nt, sizeof(IMAGE_NT_HEADERS))) return false;
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    if (!IsReadableRange(sec, sizeof(IMAGE_SECTION_HEADER) * nt->FileHeader.NumberOfSections)) return false;
+    for (unsigned i=0;i<nt->FileHeader.NumberOfSections;i++) {
+        auto &s = sec[i];
+        if (strncmp((char*)s.Name, ".text", 5) == 0 || (s.Characteristics & IMAGE_SCN_CNT_CODE)) {
+            codeStart = (uintptr_t)base + s.VirtualAddress;
+            codeEnd = codeStart + s.Misc.VirtualSize;
+            return true;
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
     return false;
 }
 
@@ -212,11 +253,10 @@ static void ScanForVTables(ModuleDump &m, HMODULE hMod) {
     for (size_t off = 0; off + stride*3 < m.size; off += stride) {
         uintptr_t cand = (uintptr_t)(base + off);
         uintptr_t p0=0,p1=0,p2=0;
-        __try {
-            p0 = *(uintptr_t*)(cand);
-            p1 = *(uintptr_t*)(cand + stride);
-            p2 = *(uintptr_t*)(cand + stride*2);
-        } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+        if (!IsReadableRange((void*)cand, stride * 3)) continue;
+        p0 = *(uintptr_t*)(cand);
+        p1 = *(uintptr_t*)(cand + stride);
+        p2 = *(uintptr_t*)(cand + stride*2);
         if (InRange(m.base, m.size, p0) && p0 >= codeStart && p0 < codeEnd
             && InRange(m.base, m.size, p1) && p1 >= codeStart && p1 < codeEnd
             && InRange(m.base, m.size, p2) && p2 >= codeStart && p2 < codeEnd) {
@@ -226,26 +266,25 @@ static void ScanForVTables(ModuleDump &m, HMODULE hMod) {
             foundVTables.push_back(vtAddr);
 
             uintptr_t colPtr = 0;
-            __try { colPtr = *((uintptr_t*)vtAddr - 1); } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+            if (!IsReadableRange((void*)(vtAddr - stride), stride)) continue;
+            colPtr = *((uintptr_t*)vtAddr - 1);
             if (!InRange(m.base, m.size, colPtr)) continue;
 
             uintptr_t pType = 0;
-            __try { pType = *(uintptr_t*)(colPtr + 12); } __except (EXCEPTION_EXECUTE_HANDLER) { pType = 0; }
+            if (IsReadableRange((void*)(colPtr + 12), stride)) pType = *(uintptr_t*)(colPtr + 12);
             if (!InRange(m.base, m.size, pType)) {
-                __try { pType = *(uintptr_t*)(colPtr + 16); } __except (EXCEPTION_EXECUTE_HANDLER) { pType = 0; }
+                if (IsReadableRange((void*)(colPtr + 16), stride)) pType = *(uintptr_t*)(colPtr + 16);
             }
             if (!InRange(m.base, m.size, pType)) continue;
 
             uintptr_t nameAddr = pType + 8;
             std::string name;
-            __try {
+            if (IsReadableRange((void*)nameAddr, 3)) {
                 const char *s = (const char*)nameAddr;
-                if (s) {
-                    size_t L = 0;
-                    while (L < 256 && s[L] && isprint((unsigned char)s[L])) ++L;
-                    if (L > 2) name.assign(s, s+L);
-                }
-            } __except (EXCEPTION_EXECUTE_HANDLER) { name.clear(); }
+                size_t L = 0;
+                while (L < 256 && IsReadableRange(s + L, 1) && s[L] && isprint((unsigned char)s[L])) ++L;
+                if (L > 2) name.assign(s, s+L);
+            }
 
             if (name.empty()) continue;
 
@@ -261,23 +300,21 @@ static void ScanForVTables(ModuleDump &m, HMODULE hMod) {
             SIZE_T pointerSize = sizeof(void*);
             bool is64 = (pointerSize == 8);
             // Offsets in CompleteObjectLocator vary by platform; on x64, fields after three DWORDs are pointers
-            __try {
-                if (is64) {
-                    // signature(4), offset(4), cdOffset(4), reserved(4), pType(8), pClass(8)
-                    uintptr_t pType = *(uintptr_t*)(colPtr + 8 + 8); // conservative fallback
-                    phd = *(uintptr_t*)(colPtr + 8 + 8 + sizeof(uintptr_t));
-                } else {
-                    // x86: signature(4), offset(4), cdOffset(4), pType(4), pClass(4)
-                    uintptr_t pType = *(uintptr_t*)(colPtr + 12);
+            if (is64) {
+                if (IsReadableRange((void*)(colPtr + 16), stride)) {
                     phd = *(uintptr_t*)(colPtr + 16);
                 }
-            } __except (EXCEPTION_EXECUTE_HANDLER) { phd = 0; }
+            } else {
+                if (IsReadableRange((void*)(colPtr + 16), sizeof(uint32_t))) {
+                    phd = *(uintptr_t*)(colPtr + 16);
+                }
+            }
 
             if (InRange(m.base, m.size, phd)) {
                 // parse ClassHierarchyDescriptor: DWORD signature, DWORD attributes, DWORD numBaseClasses, pBaseClassArray (pointer)
                 uintptr_t numBase = 0;
                 uintptr_t baseArray = 0;
-                __try {
+                if (IsReadableRange((void*)phd, 24)) {
                     if (is64) {
                         numBase = *(uint32_t*)(phd + 8);
                         baseArray = *(uintptr_t*)(phd + 16);
@@ -285,27 +322,25 @@ static void ScanForVTables(ModuleDump &m, HMODULE hMod) {
                         numBase = *(uint32_t*)(phd + 8);
                         baseArray = *(uintptr_t*)(phd + 12);
                     }
-                } __except (EXCEPTION_EXECUTE_HANDLER) { numBase = 0; baseArray = 0; }
+                } else { numBase = 0; baseArray = 0; }
 
                 if (InRange(m.base, m.size, baseArray) && numBase > 0 && numBase < 1024) {
                     for (uintptr_t bi = 0; bi < numBase; ++bi) {
                         uintptr_t bdesc = 0;
-                        __try { bdesc = *(uintptr_t*)(baseArray + bi * pointerSize); } __except (EXCEPTION_EXECUTE_HANDLER) { bdesc = 0; }
+                        if (IsReadableRange((void*)(baseArray + bi * pointerSize), pointerSize)) bdesc = *(uintptr_t*)(baseArray + bi * pointerSize);
                         if (!InRange(m.base, m.size, bdesc)) continue;
                         // BaseClassDescriptor contains pTypeDescriptor at offset 0
                         uintptr_t pTypeDesc = 0;
-                        __try { pTypeDesc = *(uintptr_t*)(bdesc + 0); } __except (EXCEPTION_EXECUTE_HANDLER) { pTypeDesc = 0; }
+                        if (IsReadableRange((void*)(bdesc + 0), pointerSize)) pTypeDesc = *(uintptr_t*)(bdesc + 0);
                         if (!InRange(m.base, m.size, pTypeDesc)) continue;
                         // read name at pTypeDesc + 8 (typical) or +16 for some
                         uintptr_t nameAddr = pTypeDesc + 8;
                         std::string bname;
-                        __try {
+                        if (IsReadableRange((void*)nameAddr, 1)) {
                             const char *s = (const char*)nameAddr;
-                            if (s) {
-                                size_t L = 0; while (L < 256 && s[L] && isprint((unsigned char)s[L])) ++L;
-                                if (L>0) bname.assign(s, s+L);
-                            }
-                        } __except (EXCEPTION_EXECUTE_HANDLER) { bname.clear(); }
+                            size_t L = 0; while (L < 256 && IsReadableRange(s + L, 1) && s[L] && isprint((unsigned char)s[L])) ++L;
+                            if (L>0) bname.assign(s, s+L);
+                        }
                         // For each vtable entry method, attempt to resolve symbol name
                     }
                 }
@@ -321,7 +356,8 @@ static void ScanForVTables(ModuleDump &m, HMODULE hMod) {
                 // iterate first 64 entries or until non-code
                 for (size_t mi = 0; mi < 256; ++mi) {
                     uintptr_t maddr = 0;
-                    __try { maddr = *(uintptr_t*)(v.address + mi * stride); } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+                    if (!IsReadableRange((void*)(v.address + mi * stride), stride)) break;
+                    maddr = *(uintptr_t*)(v.address + mi * stride);
                     if (!maddr) break;
                     // validate maddr within process
                     // Try to get symbol
@@ -407,18 +443,14 @@ static void ExtractRTTI(ModuleDump &m, HMODULE hMod) {
 }
 
 // Build a small hex prefix for a function, safe memory access
-static std::string HexPrefix(uintptr_t addr, size_t maxBytes=32) {
+static std::string HexPrefix(uintptr_t addr, size_t maxBytes/*=32*/) {
     std::ostringstream ss;
     ss << std::hex << std::setfill('0');
-    __try {
-        const unsigned char *p = (const unsigned char*)addr;
-        for (size_t i=0;i<maxBytes;i++) {
-            unsigned char b = p[i];
-            ss << std::setw(2) << (int)b;
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // if we can't read, return empty
-        return std::string();
+    const unsigned char *p = (const unsigned char*)addr;
+    for (size_t i=0;i<maxBytes;i++) {
+        if (!IsReadableRange(p + i, 1)) break;
+        unsigned char b = *(p + i);
+        ss << std::setw(2) << (int)b;
     }
     return ss.str();
 }
