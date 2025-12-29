@@ -8,23 +8,42 @@
 #include <string>
 #include <vector>
 #include <fstream>
+
+#include <winrt/base.h>
+#include <winrt/Windows.UI.ViewManagement.h>
+#include <winrt/Windows.ApplicationModel.Core.h>
+#include <winrt/Windows.UI.Core.h>
 #include <sstream>
 #include <iomanip>
-#include <filesystem>
-#include <algorithm>
-#include <cctype>
-#include <cstring>
-#include <cstdio>
-#include <io.h>
-#include <fcntl.h>
-// MinHook removed: no runtime hooking included in SDKDumperProject
-
-namespace fs = std::filesystem;
-
-namespace SDKDumper {
-
-// Console logging helpers ----------------------------------------------------
-static HANDLE g_hConsole = nullptr;
+    switch (ul_reason_for_call) {
+        case DLL_PROCESS_ATTACH:
+            DisableThreadLibraryCalls(hModule);
+            // ensure console and immediate logging so user can see attach
+            InitConsole();
+            ConsolePrintf(FOREGROUND_GREEN | FOREGROUND_INTENSITY, "SDKDumper: DLL attached\n");
+            FileLog("DllMain: attached");
+            // Try to schedule dump on the UI dispatcher similar to Solstice
+            try {
+                winrt::Windows::ApplicationModel::Core::CoreApplication::MainView().CoreWindow().Dispatcher().RunAsync(
+                    winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+                    []() {
+                        FileLog("Dispatcher: invoking DumpAll");
+                        DumpAll();
+                    }
+                );
+            } catch (...) {
+                // fallback to background thread if dispatcher unavailable
+                FileLog("Dispatcher unavailable, starting background thread");
+                StartDumpThread();
+            }
+            (void)0;
+            break;
+        case DLL_PROCESS_DETACH:
+            (void)0;
+            break;
+    }
+    return TRUE;
+}
 static void InitConsole() {
     if (g_hConsole) return;
     if (!AllocConsole()) return;
@@ -603,6 +622,29 @@ static void DumpAll() {
 }
 
 static DWORD WINAPI ThreadProc(LPVOID) {
+    // Give the process a moment to finish initialization
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    FileLog("ThreadProc: attempting dispatcher invocation");
+    // Try dispatcher first (safe outside DllMain)
+    try {
+        auto view = winrt::Windows::ApplicationModel::Core::CoreApplication::MainView();
+        if (view) {
+            auto disp = view.CoreWindow().Dispatcher();
+            if (disp) {
+                FileLog("ThreadProc: scheduling DumpAll on dispatcher");
+                disp.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal, []() {
+                    FileLog("Dispatcher: invoking DumpAll (from thread)");
+                    DumpAll();
+                });
+                return 0;
+            }
+        }
+    } catch (...) {
+        FileLog("ThreadProc: dispatcher attempt threw");
+    }
+
+    // Fallback: run DumpAll directly on worker thread
+    FileLog("ThreadProc: running DumpAll directly");
     DumpAll();
     return 0;
 }
@@ -611,6 +653,7 @@ void StartDumpThread() {
     // Make sure console exists before spawning background thread so logs show immediately
     InitConsole();
     ConsolePrintf(FOREGROUND_GREEN | FOREGROUND_INTENSITY, "SDKDumper: creating background dump thread\n");
+    FileLog("StartDumpThread: creating thread");
     HANDLE h = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (h) CloseHandle(h);
 }
