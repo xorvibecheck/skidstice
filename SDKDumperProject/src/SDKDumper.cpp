@@ -546,9 +546,23 @@ static void WriteOutputs(const std::wstring &outdir, const std::vector<ModuleDum
     }
 }
 
+// Simple file logger (appends) to C:\SDK_DUMP\sdkdumper.log for reliability when console isn't visible
+static void FileLog(const std::string &s) {
+    const wchar_t *outdir = L"C:\\SDK_DUMP";
+    // ensure dir exists
+    CreateDirectoryW(outdir, NULL);
+    std::string path = "C:\\SDK_DUMP\\sdkdumper.log";
+    std::ofstream f(path, std::ios::app);
+    if (f.is_open()) {
+        f << s << std::endl;
+        f.close();
+    }
+}
+
 static void DumpAll() {
     // Ensure console is present early so we can report failures
     InitConsole();
+    FileLog("DumpAll: started");
 
     // Use explicit root path per request: C:\\SDK_DUMP
     std::wstring outdir = L"C:\\SDK_DUMP";
@@ -581,9 +595,11 @@ static void DumpAll() {
         // final newline after progress
         printf("\n");
         ConsolePrintf(FOREGROUND_GREEN | FOREGROUND_INTENSITY, "SDKDumper: module parsing complete (%zu modules)\n", dumps.size());
+        FileLog("DumpAll: module parsing complete");
     }
 
     WriteOutputs(outdir, dumps);
+    FileLog("DumpAll: outputs written");
 }
 
 static DWORD WINAPI ThreadProc(LPVOID) {
@@ -606,6 +622,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID) {
     switch (ul_reason_for_call) {
         case DLL_PROCESS_ATTACH:
             DisableThreadLibraryCalls(hModule);
+            // ensure console and immediate logging so user can see attach
+            InitConsole();
+            ConsolePrintf(FOREGROUND_GREEN | FOREGROUND_INTENSITY, "SDKDumper: DLL attached\n");
+            FileLog("DllMain: attached");
             StartDumpThread();
             (void)0;
             break;
