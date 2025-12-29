@@ -15,35 +15,22 @@
 #include <winrt/Windows.UI.Core.h>
 #include <sstream>
 #include <iomanip>
-    switch (ul_reason_for_call) {
-        case DLL_PROCESS_ATTACH:
-            DisableThreadLibraryCalls(hModule);
-            // ensure console and immediate logging so user can see attach
-            InitConsole();
-            ConsolePrintf(FOREGROUND_GREEN | FOREGROUND_INTENSITY, "SDKDumper: DLL attached\n");
-            FileLog("DllMain: attached");
-            // Try to schedule dump on the UI dispatcher similar to Solstice
-            try {
-                winrt::Windows::ApplicationModel::Core::CoreApplication::MainView().CoreWindow().Dispatcher().RunAsync(
-                    winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
-                    []() {
-                        FileLog("Dispatcher: invoking DumpAll");
-                        DumpAll();
-                    }
-                );
-            } catch (...) {
-                // fallback to background thread if dispatcher unavailable
-                FileLog("Dispatcher unavailable, starting background thread");
-                StartDumpThread();
-            }
-            (void)0;
-            break;
-        case DLL_PROCESS_DETACH:
-            (void)0;
-            break;
-    }
-    return TRUE;
-}
+#include <filesystem>
+#include <cstdarg>
+#include <cstdint>
+#include <thread>
+#include <chrono>
+#include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <cstdio>
+#include <io.h>
+#include <fcntl.h>
+
+namespace fs = std::filesystem;
+
+// Console logging helpers ----------------------------------------------------
+static HANDLE g_hConsole = nullptr;
 static void InitConsole() {
     if (g_hConsole) return;
     if (!AllocConsole()) return;
