@@ -547,13 +547,16 @@ static void WriteOutputs(const std::wstring &outdir, const std::vector<ModuleDum
 }
 
 static void DumpAll() {
-    std::wstring local = GetLocalAppDataPath();
-    if (local.empty()) return;
-    std::wstring outdir = local + L"\\SDK_DUMP";
-    if (!EnsureDirectory(outdir)) return;
-
-    // Initialize console for progress feedback
+    // Ensure console is present early so we can report failures
     InitConsole();
+
+    // Use explicit root path per request: C:\\SDK_DUMP
+    std::wstring outdir = L"C:\\SDK_DUMP";
+    if (!EnsureDirectory(outdir)) {
+        ConsolePrintf(FOREGROUND_RED | FOREGROUND_INTENSITY, "SDKDumper: failed to create output directory: %s\n", Utf8FromWide(outdir).c_str());
+        return;
+    }
+
     ConsolePrintf(FOREGROUND_GREEN | FOREGROUND_INTENSITY, "SDKDumper: starting dump to %s\n", Utf8FromWide(outdir).c_str());
 
     HMODULE hMods[1024];
@@ -589,6 +592,9 @@ static DWORD WINAPI ThreadProc(LPVOID) {
 }
 
 void StartDumpThread() {
+    // Make sure console exists before spawning background thread so logs show immediately
+    InitConsole();
+    ConsolePrintf(FOREGROUND_GREEN | FOREGROUND_INTENSITY, "SDKDumper: creating background dump thread\n");
     HANDLE h = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
     if (h) CloseHandle(h);
 }
